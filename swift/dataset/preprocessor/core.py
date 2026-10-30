@@ -3,15 +3,17 @@ import ast
 import json
 import numpy as np
 import os
+import pickle
 from collections import Counter
 from contextlib import contextmanager
 from datasets import Dataset as HfDataset
 from datasets import Image
 from datasets import IterableDataset as HfIterableDataset
 from datasets import Value
-from functools import partial
 from itertools import chain
 from modelscope.hub.utils.utils import get_cache_dir
+from multiprocess import get_context
+from multiprocess.reduction import ForkingPickler
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
 from swift.template import history_to_messages
@@ -26,9 +28,48 @@ logger = get_logger()
 _pair_keys = ['messages', 'images', 'videos', 'audios', 'tools', 'objects']
 
 
-def _preprocess_in_worker(func: Callable, num_proc: int, *args, **kwargs):
-    limit_worker_num_threads(num_proc)
-    return func(*args, **kwargs)
+class _MapFunction:
+    """The function run by the `datasets.map(num_proc=...)` worker processes."""
+
+    def __init__(self, func: Callable, num_proc: int):
+        self.func = func
+        self.num_proc = num_proc
+        self._payload = None
+
+    def __call__(self, *args, **kwargs):
+        limit_worker_num_threads(self.num_proc)
+        return self.func(*args, **kwargs)
+
+    def __getstate__(self):
+        # Used by the `datasets` fingerprint, which does not depend on the transport below.
+        return {'func': self.func, 'num_proc': self.num_proc, '_payload': None}
+
+
+def _load_map_function(payload: bytes) -> _MapFunction:
+    return _MapFunction(*pickle.loads(payload))
+
+
+def _reduce_map_function(map_func: _MapFunction):
+    """Send `map_func` to the workers.
+
+    `multiprocess` pickles the function once per worker job with dill, a pure-Python pickler, and the
+    function holds the template with its tokenizer: about 2 s of serial work in the main process per job.
+    Pickle it once with the C pickler and send the same bytes to every job instead. With fork, the classes
+    pickled by reference are available in the workers; otherwise keep the dill path.
+    """
+    if map_func._payload is None:
+        map_func._payload = False
+        if get_context().get_start_method() == 'fork':
+            try:
+                map_func._payload = pickle.dumps((map_func.func, map_func.num_proc), protocol=pickle.HIGHEST_PROTOCOL)
+            except Exception:  # e.g. lambdas, which only dill can pickle
+                pass
+    if map_func._payload:
+        return _load_map_function, (map_func._payload, )
+    return _MapFunction, (map_func.func, map_func.num_proc)
+
+
+ForkingPickler.register(_MapFunction, _reduce_map_function)
 
 
 class RowPreprocessor:
@@ -400,7 +441,7 @@ class RowPreprocessor:
             map_func = self.batched_preprocess
             if isinstance(dataset, HfDataset) and num_proc is not None and num_proc > 1:
                 # `datasets` runs `map_func` in `num_proc` worker processes.
-                map_func = partial(_preprocess_in_worker, map_func, num_proc)
+                map_func = _MapFunction(map_func, num_proc)
             dataset_mapped = dataset.map(
                 map_func,
                 fn_kwargs={
